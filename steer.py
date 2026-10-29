@@ -82,6 +82,7 @@ def median_resid_norm(model, tok, layer, prompts):
     class Tap(nn.Module):
         def __init__(self, inner):
             super().__init__(); self.inner = inner
+            self.is_linear = inner.is_linear  # the model loop reads this to pick the mask
         def __call__(self, *args, **kw):
             out = self.inner(*args, **kw)
             norms.extend(mx.linalg.norm(out[0, 1:].astype(mx.float32), axis=-1).tolist())
