@@ -3,3 +3,5 @@ out/
 __pycache__/
 .env
 *.log
+BRIEF.md
+script.md
