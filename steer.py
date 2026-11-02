@@ -11,16 +11,25 @@ Dose follows the recipe chiefofautism and @_lyraaaa_ posted: the value added to 
 down_proj input is  dose * median(||resid leaving layer L||, tokens 1:) / ||W_down[:, n]||,
 added at every token. That makes the push about `dose` times the size of the residual stream.
 
-Raw generations go to out/ (gitignored). The terminal shows only a redacted view plus a
-hostility score, so nothing graphic has to be read or shown on camera.
+Raw generations go to out/ (gitignored). The terminal shows only a redacted view plus two
+scores, so nothing graphic has to be read or shown on camera:
+  words  the crude word-list meter (hostile words per 100 words)
+  jev    P(hostile) from the Jev classifier on OpenRouter (see judge.py; needs OPENROUTER_API_KEY,
+         skip with --no-judge), plus a per-dose summary: turned / severity / fluent
+In a terminal it waits for Enter before each dose so you can talk over it (--no-pause to skip).
 """
-import argparse, json, re, time
+import argparse, json, os, re, sys, time
 from pathlib import Path
+
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")  # keep the take clean
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm import load, generate
 from mlx_lm.sample_utils import make_sampler
+
+import judge
+import ui
 
 MODEL = "mlx-community/Qwen3.8-27B-8bit"
 
@@ -108,6 +117,79 @@ def redact(text, n=160):
     return HOSTILE.sub("█████", " ".join(text.split()))[:n]
 
 
+def load_model():
+    t0 = time.time()
+    with ui.loading(MODEL):
+        model, tok = load(MODEL)
+    ui.loaded(time.time() - t0, len(layers(model)))
+    return model, tok
+
+
+def read_prompts(path="prompts.txt"):
+    return [p.strip() for p in Path(path).read_text().splitlines() if p.strip() and not p.startswith("#")]
+
+
+def run(model, tok, targets, doses, prompts, *, mode="add", max_tokens=200, temp=0.0, out="out",
+        use_jev=True, pausing=True):
+    """targets: [(layer, [neurons]), ...], all pushed at the same dose. Returns the rows."""
+    L = layers(model)
+    out = Path(out); out.mkdir(exist_ok=True)
+    calib = []
+    with ui.console.status(f"[grey50]measuring the running state on {len(prompts)} prompts...", spinner="dots"):
+        for layer, neurons in targets:
+            med = median_resid_norm(model, tok, layer, prompts)
+            cols = down_col_norms(L[layer].mlp, neurons)
+            calib.append({"layer": layer, "neurons": neurons, "median_resid_norm": med, "w_down_col_norm": cols, "unit": med / cols[0]})
+    ui.calibration(calib, doses)
+
+    bases = {layer: L[layer].mlp for layer, _ in targets}
+    rows = []
+    try:
+        for dose in doses:
+            ui.pause(f"dose {dose:g}", pausing)
+            ui.dose_rule(dose, calib)
+            steers = []
+            for c in calib:
+                s_ = SteeredMLP(bases[c["layer"]], c["neurons"], dose * c["unit"], mode)
+                L[c["layer"]].mlp = s_; steers.append(s_)
+            block = []
+            with ui.DoseTable(use_jev) as table:
+                for p in prompts:
+                    table.working(p)
+                    prompt = tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, enable_thinking=False)
+                    for s_ in steers: s_.trace.clear()
+                    text = generate(model, tok, prompt=prompt, max_tokens=max_tokens, sampler=make_sampler(temp=temp), verbose=False)
+                    row = {"targets": calib, "mode": mode, "dose": dose, "prompt": p,
+                           "baseline_activation_last_prompt_token": [s_.trace[0] if s_.trace else None for s_ in steers],
+                           "hostility_per_100w": hostility(text), "output": text}
+                    if use_jev:
+                        row["jev"] = judge.judge(p, text)
+                    rows.append(row); block.append(row)
+                    table.add(p, row["hostility_per_100w"], redact(text), row.get("jev"))
+            ui.dose_summary(dose, block, use_jev, judge.HOSTILE_P)
+            for layer, m in bases.items(): L[layer].mlp = m
+    finally:
+        for layer, m in bases.items(): L[layer].mlp = m  # never leave the model steered
+
+    tag = "+".join(f"L{l}-N{'-'.join(map(str, n))}" for l, n in targets) + f"-{mode}"
+    path = out / f"{tag}.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    if len(doses) > 1:
+        ui.pause("the summary", pausing)
+        ui.final(rows, use_jev, judge.HOSTILE_P, path)
+    else:
+        ui.console.print(f"[grey50]raw text saved to {path} (not shown)[/]")
+    return rows
+
+
+def judge_enabled(no_judge=False):
+    return not no_judge and bool(os.environ.get("OPENROUTER_API_KEY"))
+
+
+def pause_enabled(no_pause=False):
+    return not no_pause and sys.stdin.isatty() and sys.stdout.isatty()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--layer", type=int, required=True, help="0-based decoder layer index")
@@ -119,42 +201,17 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=200)
     ap.add_argument("--temp", type=float, default=0.0)
     ap.add_argument("--out", default="out")
+    ap.add_argument("--no-judge", action="store_true", help="skip the Jev classifier, word meter only")
+    ap.add_argument("--no-pause", action="store_true", help="don't wait for Enter between doses (auto when not a TTY)")
     a = ap.parse_args()
-
-    t0 = time.time()
-    model, tok = load(MODEL)
-    L = layers(model)
-    print(f"loaded {MODEL} in {time.time() - t0:.0f}s; {len(L)} layers")
-    prompts = [p.strip() for p in Path(a.prompts).read_text().splitlines() if p.strip() and not p.startswith("#")]
-    out = Path(a.out); out.mkdir(exist_ok=True)
-    # targets: (layer, [neurons]); --also adds more layer:neuron pairs pushed at the same dose
+    use_jev = judge_enabled(a.no_judge)
+    doses = [float(d) for d in a.doses.split(",")]
     targets = [(a.layer, a.neuron)] + [(int(t.split(":")[0]), [int(t.split(":")[1])]) for t in a.also]
-    calib = []
-    for layer, neurons in targets:
-        med = median_resid_norm(model, tok, layer, prompts)
-        cols = down_col_norms(L[layer].mlp, neurons)
-        calib.append({"layer": layer, "neurons": neurons, "median_resid_norm": med, "w_down_col_norm": cols, "unit": med / cols[0]})
-        print(f"L{layer} N{neurons}: median ||resid|| {med:.2f}   ||W_down[:, n]|| {cols[0]:.4f}   delta per 1.0 dose {med / cols[0]:.2f}")
-    bases = {layer: L[layer].mlp for layer, _ in targets}
-    rows = []
-    for dose in [float(d) for d in a.doses.split(",")]:
-        steers = []
-        for c in calib:
-            s_ = SteeredMLP(bases[c["layer"]], c["neurons"], dose * c["unit"], a.mode)
-            L[c["layer"]].mlp = s_; steers.append(s_)
-        for p in prompts:
-            prompt = tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True, enable_thinking=False)
-            for s_ in steers: s_.trace.clear()
-            text = generate(model, tok, prompt=prompt, max_tokens=a.max_tokens, sampler=make_sampler(temp=a.temp), verbose=False)
-            row = {"targets": calib, "mode": a.mode, "dose": dose, "prompt": p,
-                   "baseline_activation_last_prompt_token": [s_.trace[0] if s_.trace else None for s_ in steers],
-                   "hostility_per_100w": hostility(text), "output": text}
-            rows.append(row)
-            print(f"dose {dose:>5}  host {row['hostility_per_100w']:>5}  | {p[:38]:<38} | {redact(text)}", flush=True)
-        for layer, m in bases.items(): L[layer].mlp = m
-    tag = "+".join(f"L{l}-N{'-'.join(map(str, n))}" for l, n in targets) + f"-{a.mode}"
-    (out / f"{tag}.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
-    print(f"wrote {out / (tag + '.jsonl')}")
+    ui.header(MODEL, targets, doses, use_jev, os.environ.get("JEV_MODEL", "~typesafe/jev-latest"))
+    model, tok = load_model()
+    run(model, tok, targets, doses, read_prompts(a.prompts), mode=a.mode, max_tokens=a.max_tokens,
+        temp=a.temp, out=a.out, use_jev=use_jev, pausing=pause_enabled(a.no_pause))
+
 
 if __name__ == "__main__":
     main()
